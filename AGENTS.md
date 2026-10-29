@@ -11,12 +11,13 @@ This repository publishes small browser userscripts. The current scripts are:
 - `ext-to-arr-push-button.user.js`: adds a "Send to Sonarr/Radarr/Lidarr" button on ext.to search results that resolves the torrent's magnet link and pushes it straight into the matching *arr instance via its `release/push` API.
 
 - `mozaik-to-pdf.user.js`: runs in the presse.mozaik.co (PressReader white-label) viewer, captures the page tickets from `IssueInfo/GetPageKeys`, and downloads every page from `i.prcdn.co` as a ZIP of JPEGs or a PDF (both written by small built-in, dependency-free writers). It also adds "Download PDF/ZIP" buttons on `app.mozaik.co/press/<id>` issue pages.
+- `telerama-to-pdf.user.js`: runs in the magazine.telerama.fr (Twipe) viewer for Telerama and Sortir, captures the page list and session ids from the viewer's own requests, and downloads every page PDF as a ZIP or as one merged PDF (merged with pdf-lib).
 
 There is no package manager, build step, bundler, or automated test suite in this repo.
 
 ## Editing Rules
 
-- Keep userscripts self-contained and dependency-free unless the repository intentionally adds a build system.
+- Keep userscripts self-contained and dependency-free unless the repository intentionally adds a build system. `telerama-to-pdf.user.js` is an intentional exception: it `@require`s pdf-lib (pinned version, `#sha256=` integrity hash) because merging existing PDF pages is not worth hand-rolling.
 - Preserve the `// ==UserScript==` metadata block at the top of each `.js` file.
 - Keep metadata aligned and include the repository URL with `@homepageURL` for published scripts.
 - Use plain browser JavaScript that works in Tampermonkey with `@grant none` when possible. The two `arr-`/`ext-to-arr-` scripts are an intentional exception: they need `GM_xmlhttpRequest` (bypass CORS to reach a LAN *arr instance from ext.to), `GM_getValue`/`GM_setValue` (store API keys outside the script source, prompting once via `prompt()` the first time each is needed), and `unsafeWindow` (patch the real page's `XMLHttpRequest`, not a sandboxed copy).
@@ -55,6 +56,15 @@ These two scripts work as a pair but run on different origins, so they cannot sh
 - "Find best" probes page 1 at increasing `scale` values and keeps the smallest one reaching the largest width (the CDN caps resolution); the chosen scale is stored with `GM_setValue('SCALE')`.
 - On `app.mozaik.co` the script only adds "Download PDF/ZIP" buttons under each "Lire" link (`a.playBt` / `a[title="Lire"]`, with a text-based fallback), on any page, not just `/press`. They set an `AUTO_DOWNLOAD` GM value (GM storage is per-script, so it crosses origins), then click "Lire" so the site's own gift-token flow opens the viewer; the viewer consumes that value (valid 3 minutes) once it has page keys and starts the download. The app branch returns early, so no `fetch`/`XMLHttpRequest` patching happens there.
 
+## Telerama to PDF Script Notes
+
+- The viewer (`magazine.telerama.fr/data/<package>/reader/reader.html#!.../pub/<pubId>/page/<n>`) is Twipe's web reader; its unminified source is `webreaders.twipecloud.net/webapp/lmo-tlr/primary/<version>/partial/web.js`, which is the reference when its requests change.
+- Pages come from the viewer's `GetPublicationPages-<pubId>.json` response (`Page[].PublicationPageID`, `PageNumber`, `ExternalPageReference` like `TLR_20261007_001`, used for file names).
+- Page PDFs live on `lmo-tlr-production-cdn.twipecloud.net` behind short-lived CloudFront signed URLs, so they cannot be built locally. The script asks for one per page with the same call as the viewer's "Page actuelle" (`retrievePdfUrl` in web.js): `GET <api>/Pdf/<PublicationPageID>/<version>/<sessionId>/<userId>/<downloadId>/url`, which returns the URL in `ReturnMessage`. A fresh URL is requested on every retry.
+- Tried and dropped: the viewer's hidden "Toutes les pages" entry (`GET <api>/api/downloadservice/requestfullpdfdownload/<userId>/<sessionId>/<orderId>/<subsId>/<packageId>[/<pubId>].json`, with `orderId` from the `TW_READER_SESSION` cookie and `subsId` from `TW_LOGGED_IN`; `0/0` fails with "Order mismatch" E10). It does return a signed `DownloadLink` (`FullPublicationPdf-<pubId>.pdf` / `FullContentPackagePdf-<packageId>.pdf`), but the CDN answers 403 even in a plain browser tab: the file is never generated when the issue data has `FullPdfAvailable: false`, which is also why the viewer hides the entry. Each call also creates a new `DownloadId`, so do not call it speculatively.
+- `userId`/`sessionId`/`downloadId` (and the request headers, such as `x-api-key`) are captured from the viewer's `GetDownloadCredentials/<userId>/<sessionId>/<downloadId>` request, or from a `Pdf/.../url` request if the user used the viewer's download menu.
+- The Stop button and `activeRequests`/`CancelledError` handling follow `mozaik-to-pdf.user.js`.
+
 ## Validation
 
 For metadata-only edits, inspect the diff.
@@ -75,6 +85,13 @@ For `arr-ext-to-button.user.js` and `ext-to-arr-push-button.user.js`:
 4. Click the real ext.to magnet icon directly first - confirm it still opens your OS's magnet handler as normal.
 5. Click "Send to ..." on a result - confirm you're prompted once for the relevant API key (first run only), and that no OS magnet-handler prompt appears this time.
 6. Confirm the button ends on "Sent (OK)" for a release Sonarr/Radarr/Lidarr can grab, or a specific rejection reason otherwise (check the console for the full `release/push` response on rejection).
+
+For `telerama-to-pdf.user.js`:
+
+1. Open a Telerama and a Sortir issue from `telerama.fr/kiosque/telerama` and `/kiosque/sortir`.
+2. Confirm the panel goes from waiting to "Telerama 2026-10-07: 152 pages" (name and date from the issue) with ZIP and PDF enabled (console shows `GetPublicationPages` and `captured session ids`).
+3. Download the ZIP and check it holds one `page-NNN.pdf` per page; download the PDF and check page count, order and `/Title`.
+4. Press Stop during a download and confirm it ends on "Stopped.".
 
 ## Versioning
 
