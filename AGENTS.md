@@ -64,6 +64,8 @@ These two scripts work as a pair but run on different origins, so they cannot sh
 - Tried and dropped: the viewer's hidden "Toutes les pages" entry (`GET <api>/api/downloadservice/requestfullpdfdownload/<userId>/<sessionId>/<orderId>/<subsId>/<packageId>[/<pubId>].json`, with `orderId` from the `TW_READER_SESSION` cookie and `subsId` from `TW_LOGGED_IN`; `0/0` fails with "Order mismatch" E10). It does return a signed `DownloadLink` (`FullPublicationPdf-<pubId>.pdf` / `FullContentPackagePdf-<packageId>.pdf`), but the CDN answers 403 even in a plain browser tab: the file is never generated when the issue data has `FullPdfAvailable: false`, which is also why the viewer hides the entry. Each call also creates a new `DownloadId`, so do not call it speculatively.
 - `userId`/`sessionId`/`downloadId` (and the request headers, such as `x-api-key`) are captured from the viewer's `GetDownloadCredentials/<userId>/<sessionId>/<downloadId>` request, or from a `Pdf/.../url` request if the user used the viewer's download menu.
 - The Stop button and `activeRequests`/`CancelledError` handling follow `mozaik-to-pdf.user.js`.
+- The panel starts at the bottom right, with its lines and buttons centered, and is at most 180px wide, so it fits the margin the viewer leaves there. It can be dragged anywhere except on its buttons, and the position is kept in `localStorage` (`telerama-to-pdf.panel-position`) and clamped to the window.
+- Files are named `Télérama No. 4007 - 28 Octobre 2026` (`TLR`) or `Télérama Paris No. 4007 - 28 Octobre 2026` (`SORTTLR`, the Sortir supplement, which shares the Télérama number). No request carries the issue number, so `findIssueNumber()` reads it from the cover PDF. `lookupIssue()` fetches the cover as soon as the session ids are known (one `Pdf/.../url` call plus one page download), so the panel shows the final name before any download. Covers use WinAnsi fonts, so the literal strings of the page's decoded streams join into `No 4007`. Lines are joined without separators (`Nº 4007Du 31/10`), and the Télérama cover also prints `CPPAP Nº 0630 C 80864` (press registration number), which `ISSUE_RE` skips. Inner-page folios (`Télérama Paris 4007`) use subset fonts with custom glyph codes for the digits and cannot be read that way. Without a number the name falls back to `Télérama - 28 Octobre 2026`. The source keeps accents as `\u` escapes, and the ZIP sets the UTF-8 name flag.
 
 ## Validation
 
@@ -89,8 +91,8 @@ For `arr-ext-to-button.user.js` and `ext-to-arr-push-button.user.js`:
 For `telerama-to-pdf.user.js`:
 
 1. Open a Telerama and a Sortir issue from `telerama.fr/kiosque/telerama` and `/kiosque/sortir`.
-2. Confirm the panel goes from waiting to "Telerama 2026-10-07: 152 pages" (name and date from the issue) with ZIP and PDF enabled (console shows `GetPublicationPages` and `captured session ids`).
-3. Download the ZIP and check it holds one `page-NNN.pdf` per page; download the PDF and check page count, order and `/Title`.
+2. Confirm the panel goes from waiting to "Télérama No. 4007 - 07 Octobre 2026" / "152 pages" (name and date from the issue, issue number from the cover a moment later) with ZIP and PDF enabled (console shows `GetPublicationPages` and `captured session ids`).
+3. Download the ZIP and check it holds one `page-NNN.pdf` per page; download the PDF and check page count, order and `/Title`. Both should be named like `Télérama No. 4007 - 28 Octobre 2026` (`Télérama Paris ...` for Sortir); a date-only name means the cover number was not found (console warning).
 4. Press Stop during a download and confirm it ends on "Stopped.".
 
 ## Versioning

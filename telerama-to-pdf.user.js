@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Telerama - Download issue as PDF/ZIP
 // @namespace    local.telerama-to-pdf
-// @version      0.1.0
+// @version      0.2.0
 // @description  Adds ZIP and PDF buttons to the magazine.telerama.fr (Twipe) viewer that download the open Telerama or Sortir issue as one merged PDF or as a ZIP of page PDFs
 // @homepageURL  https://github.com/ocococococ/userscripts
 // @downloadURL  https://raw.githubusercontent.com/ocococococ/userscripts/main/telerama-to-pdf.user.js
@@ -30,7 +30,28 @@
   const CONCURRENCY = 4;
   const RETRIES = 2;
   // First part of ExternalPageReference ("TLR_20261007_001") -> file name.
-  const MAGAZINE_NAMES = { TLR: 'Telerama' };
+  const MAGAZINE_NAMES = { TLR: 'T\u00e9l\u00e9rama', SORTTLR: 'T\u00e9l\u00e9rama Paris' };
+  const MONTH_NAMES = [
+    'Janvier',
+    'F\u00e9vrier',
+    'Mars',
+    'Avril',
+    'Mai',
+    'Juin',
+    'Juillet',
+    'Ao\u00fbt',
+    'Septembre',
+    'Octobre',
+    'Novembre',
+    'D\u00e9cembre',
+  ];
+  // Issue number as printed on the cover ("SUPPLEMENT DE TELERAMA No 4007"). Inner page
+  // folios ("Telerama Paris 4007") use subset fonts whose digits are not plain text.
+  // Also matches "N<degree sign> 4007" and "N<masculine ordinal> 4007" (Telerama covers).
+  // The next line's text follows directly ("4007Du 31/10"), so no \b after the number.
+  // Skips the press registration number nearby ("CPPAP N<masculine ordinal> 0630 C 80864").
+  const ISSUE_RE = /(?<!CPPAP\s*)\bN[o\u00b0\u00ba]\.?\s*([1-9]\d{3,4})(?!\d)/;
+  const ISSUE_SEARCH_PAGES = 3;
 
   // pubId -> [{id, number, reference}] sorted by page number
   const pagesByPub = new Map();
@@ -38,6 +59,9 @@
   // so they have to be asked for with these.
   let session = null; // {apiOrigin, version, userId, sessionId, downloadId, headers}
   let lastPubId = null;
+  // pubId -> issue number ("4007"), or null when none was found.
+  const issueByPub = new Map();
+  const issueLookups = new Set();
   let busy = false;
   // Set by the Stop button; checked between requests, while in-flight
   // requests are aborted directly.
@@ -282,6 +306,9 @@
     return (crc ^ 0xffffffff) >>> 0;
   }
 
+  // General purpose bit 11: entry names are UTF-8 (accented magazine names).
+  const ZIP_UTF8_FLAG = 0x0800;
+
   function buildZip(files) {
     const encoder = new TextEncoder();
     const now = new Date();
@@ -299,6 +326,7 @@
       const local = new DataView(new ArrayBuffer(30));
       local.setUint32(0, 0x04034b50, true);
       local.setUint16(4, 20, true);
+      local.setUint16(6, ZIP_UTF8_FLAG, true);
       local.setUint16(10, dosTime, true);
       local.setUint16(12, dosDate, true);
       local.setUint32(14, crc, true);
@@ -311,6 +339,7 @@
       entry.setUint32(0, 0x02014b50, true);
       entry.setUint16(4, 20, true);
       entry.setUint16(6, 20, true);
+      entry.setUint16(8, ZIP_UTF8_FLAG, true);
       entry.setUint16(12, dosTime, true);
       entry.setUint16(14, dosDate, true);
       entry.setUint32(16, crc, true);
@@ -353,14 +382,92 @@
 
   // --- Download ---
 
-  // ExternalPageReference "TLR_20261007_001" -> "telerama-2026-10-07" / "Telerama 2026-10-07"
-  function buildNames(pubId, pages) {
+  // Literal strings of a decoded PDF content stream, joined. Covers use WinAnsi
+  // fonts, so "[(N)]TJ (o)Tj [( 4)2.02(00)23.98(7)]TJ" reads "No 4007".
+  function pdfLiteralText(bytes) {
+    const raw = new TextDecoder('latin1').decode(bytes);
+    let text = '';
+    for (const [, body] of raw.matchAll(/\(((?:\\[\s\S]|[^\\)])*)\)/g)) {
+      text += body.replaceAll(/\\([0-7]{1,3}|[\s\S])/g, (_, esc) =>
+        /^[0-7]/.test(esc) ? String.fromCodePoint(Number.parseInt(esc, 8)) : esc
+      );
+    }
+    return text;
+  }
+
+  async function findIssueNumberInPage(bytes) {
+    const { PDFDocument, PDFRawStream, PDFName, decodePDFRawStream } = PDFLib;
+    const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    for (const [, object] of doc.context.enumerateIndirectObjects()) {
+      if (!(object instanceof PDFRawStream) || object.dict.get(PDFName.of('Subtype')) === PDFName.of('Image')) {
+        continue;
+      }
+      let decoded;
+      try {
+        decoded = decodePDFRawStream(object).decode();
+      } catch {
+        continue; // Filter pdf-lib cannot decode; not a text stream anyway.
+      }
+      const match = ISSUE_RE.exec(pdfLiteralText(decoded));
+      if (match) return match[1];
+    }
+    return null;
+  }
+
+  // Issue number from the first pages' text, or null.
+  async function findIssueNumber(files) {
+    for (const { page, bytes } of files.slice(0, ISSUE_SEARCH_PAGES)) {
+      try {
+        // Sequential on purpose: usually found on the cover.
+        const issue = await findIssueNumberInPage(bytes); // NOSONAR
+        if (issue) return issue;
+      } catch (err) {
+        console.warn(LOG, `could not read the text of page ${page}`, err);
+      }
+    }
+    return null;
+  }
+
+  // ExternalPageReference "TLR_20261028_001" + issue "4007" -> ["Telerama No. 4007", "28 Octobre 2026"]
+  // (accented), ["Telerama", "28 Octobre 2026"] without an issue number.
+  function buildNameParts(pubId, pages, issue = null) {
     const match = /^([A-Za-z]+)_(\d{4})(\d{2})(\d{2})_/.exec(pages[0].reference);
-    if (!match) return { baseName: `telerama-${pubId}`, title: `Telerama ${pubId}` };
-    const code = match[1].toUpperCase();
-    const name = MAGAZINE_NAMES[code] || code;
-    const date = `${match[2]}-${match[3]}-${match[4]}`;
-    return { baseName: `${name.toLowerCase()}-${date}`, title: `${name} ${date}` };
+    if (!match) return [`${MAGAZINE_NAMES.TLR} ${pubId}`];
+    const [, code, year, month, day] = match;
+    const name = MAGAZINE_NAMES[code.toUpperCase()] || code;
+    const title = issue ? `${name} No. ${issue}` : name;
+    return [title, `${day} ${MONTH_NAMES[Number(month) - 1] || month} ${year}`];
+  }
+
+  // "Telerama No. 4007 - 28 Octobre 2026" (accented)
+  function buildFileName(pubId, pages, issue = null) {
+    return buildNameParts(pubId, pages, issue).join(' - ');
+  }
+
+  // Reads the issue number from the first pages as soon as the session is
+  // known, so the panel shows the final file name before any download.
+  async function lookupIssue(pubId) {
+    if (busy || !session || issueByPub.has(pubId) || issueLookups.has(pubId)) return;
+    issueLookups.add(pubId);
+    try {
+      let issue = null;
+      for (const page of pagesByPub.get(pubId).slice(0, ISSUE_SEARCH_PAGES)) {
+        // Sequential on purpose: usually found on the cover, no need for more pages.
+        const bytes = await fetchPagePdf(page); // NOSONAR
+        issue = await findIssueNumber([{ page: page.number, bytes }]); // NOSONAR
+        if (issue) break;
+      }
+      issueByPub.set(pubId, issue);
+    } catch (err) {
+      // Left unset when stopped, so it is tried again after the action.
+      if (!(err instanceof CancelledError)) {
+        console.warn(LOG, 'could not read the issue number', err);
+        issueByPub.set(pubId, null);
+      }
+    } finally {
+      issueLookups.delete(pubId);
+      updatePanel();
+    }
   }
 
   function downloadBlob(filename, blob) {
@@ -403,7 +510,6 @@
   function runDownload(format) {
     return runAction(async (pubId) => {
       const pages = pagesByPub.get(pubId);
-      const { baseName, title } = buildNames(pubId, pages);
 
       const files = await fetchAllPages(pages, (done, total) => {
         setStatus(`Downloading pages ${done}/${total}...`);
@@ -411,6 +517,10 @@
       });
 
       throwIfCancelled();
+      const issue = issueByPub.get(pubId) || (await findIssueNumber(files));
+      if (!issue) console.warn(LOG, 'no issue number found on the first pages; naming by date');
+      issueByPub.set(pubId, issue);
+      const baseName = buildFileName(pubId, pages, issue);
       setStatus(`Building ${format.toUpperCase()}...`);
       if (format === 'zip') {
         const digits = String(files.at(-1).page).length;
@@ -422,7 +532,7 @@
       } else {
         const pdf = await mergePdfs(
           files.map((file) => file.bytes),
-          title,
+          baseName,
           (done, total) => {
             setStatus(`Merging pages ${done}/${total}...`);
             setProgress(done, total);
@@ -436,7 +546,9 @@
 
   // --- Floating panel ---
 
+  const POSITION_KEY = 'telerama-to-pdf.panel-position';
   let panel = null;
+  let nameLine = null;
   let statusLine = null;
   let progressBar = null;
   let zipButton = null;
@@ -449,7 +561,7 @@
     button.type = 'button';
     button.textContent = label;
     button.style.cssText =
-      'margin-right:6px;padding:4px 10px;border:0;border-radius:4px;background:#1a73e8;color:#fff;font:600 12px sans-serif;cursor:pointer';
+      'margin:0 2px;padding:2px 8px;border:0;border-radius:3px;background:#1a73e8;color:#fff;font:600 11px/16px sans-serif;cursor:pointer';
     button.addEventListener('click', onClick);
     return button;
   }
@@ -468,26 +580,92 @@
     }
   }
 
+  function loadPanelPosition() {
+    try {
+      const position = JSON.parse(localStorage.getItem(POSITION_KEY));
+      return Number.isFinite(position?.left) && Number.isFinite(position?.top) ? position : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function savePanelPosition() {
+    try {
+      const { left, top } = panel.getBoundingClientRect();
+      localStorage.setItem(POSITION_KEY, JSON.stringify({ left, top }));
+    } catch {
+      // Storage blocked: the position just is not remembered.
+    }
+  }
+
+  // Moves the panel to (left, top), kept inside the window.
+  function placePanel(left, top) {
+    const maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
+    const maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
+    panel.style.left = `${Math.min(Math.max(0, left), maxLeft)}px`;
+    panel.style.top = `${Math.min(Math.max(0, top), maxTop)}px`;
+    panel.style.right = 'auto';
+    panel.style.bottom = 'auto';
+  }
+
+  // Dragging anywhere but on a button moves the panel; the position is
+  // remembered for the next issue.
+  function makeDraggable() {
+    panel.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0 || event.target.closest('button')) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const rect = panel.getBoundingClientRect();
+      const offsetX = event.clientX - rect.left;
+      const offsetY = event.clientY - rect.top;
+      const move = (moveEvent) => placePanel(moveEvent.clientX - offsetX, moveEvent.clientY - offsetY);
+      panel.setPointerCapture(event.pointerId);
+      panel.addEventListener('pointermove', move);
+      panel.addEventListener(
+        'lostpointercapture',
+        () => {
+          panel.removeEventListener('pointermove', move);
+          savePanelPosition();
+        },
+        { once: true }
+      );
+    });
+    window.addEventListener('resize', () => {
+      if (!panel.style.top) return;
+      const { left, top } = panel.getBoundingClientRect();
+      placePanel(left, top);
+    });
+  }
+
   function createPanel() {
     if (panel || !document.body) return;
     panel = document.createElement('div');
+    panel.title = 'Drag to move';
+    // Bottom right by default, narrow enough for the margin the viewer leaves there.
     panel.style.cssText =
-      'position:fixed;right:16px;bottom:16px;z-index:2147483647;padding:10px 12px;border-radius:8px;' +
-      'background:#fff;color:#222;box-shadow:0 2px 10px rgba(0,0,0,.3);font:12px sans-serif;max-width:260px';
+      'position:fixed;right:8px;bottom:8px;z-index:2147483647;box-sizing:border-box;max-width:180px;text-align:center;' +
+      'padding:6px 8px;border-radius:6px;background:#fff;color:#222;box-shadow:0 1px 6px rgba(0,0,0,.3);' +
+      'font:11px/14px sans-serif;cursor:move;user-select:none;touch-action:none';
+
+    nameLine = document.createElement('div');
+    nameLine.style.cssText = 'margin-bottom:2px;font-weight:600;white-space:pre-line';
 
     statusLine = document.createElement('div');
-    statusLine.style.marginBottom = '6px';
+    statusLine.style.marginBottom = '4px';
 
     progressBar = document.createElement('progress');
-    progressBar.style.cssText = 'display:none;width:100%;margin-bottom:6px';
+    progressBar.style.cssText = 'display:none;width:100%;height:8px;margin-bottom:4px';
 
     zipButton = makeButton('ZIP', () => runDownload('zip'));
     pdfButton = makeButton('PDF', () => runDownload('pdf'));
     stopButton = makeButton('Stop', cancelAction);
     stopButton.style.background = '#c0392b';
 
-    panel.append(statusLine, progressBar, zipButton, pdfButton, stopButton);
+    panel.append(nameLine, statusLine, progressBar, zipButton, pdfButton, stopButton);
     document.body.appendChild(panel);
+    makeDraggable();
+    const position = loadPanelPosition();
+    if (position) placePanel(position.left, position.top);
     updatePanel();
   }
 
@@ -495,7 +673,8 @@
     if (!pubId) return 'Waiting for the viewer to load the issue...';
     const count = pagesByPub.get(pubId).length;
     if (!session) return `${count} pages listed, waiting for session ids (open the viewer's download menu once if this stays).`;
-    return `${buildNames(pubId, pagesByPub.get(pubId)).title}: ${count} pages`;
+    if (issueLookups.has(pubId)) return `${count} pages, reading the issue number from the cover...`;
+    return `${count} pages`;
   }
 
   function updatePanel() {
@@ -510,6 +689,12 @@
       button.style.opacity = ready ? '1' : '0.5';
     }
     stopButton.style.display = busy ? '' : 'none';
+    // Before the status: a lookup it starts shows as "reading the issue number".
+    if (pubId) lookupIssue(pubId);
+    const pages = pubId && pagesByPub.get(pubId);
+    // File name parts, the date on its own line.
+    nameLine.textContent = pages ? buildNameParts(pubId, pages, issueByPub.get(pubId)).join('\n') : '';
+    nameLine.style.display = pages ? '' : 'none';
     if (!busy) setStatus(lastResult || waitingText(pubId));
   }
 
