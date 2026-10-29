@@ -10,6 +10,8 @@ This repository publishes small browser userscripts. The current scripts are:
 - `arr-ext-to-button.user.js`: adds a button on Sonarr series pages, Radarr movie pages (via IMDb ID), and Lidarr album pages (via artist/album search, resolved through Lidarr's own API) that opens a matching search on ext.to.
 - `ext-to-arr-push-button.user.js`: adds a "Send to Sonarr/Radarr/Lidarr" button on ext.to search results that resolves the torrent's magnet link and pushes it straight into the matching *arr instance via its `release/push` API.
 
+- `mozaik-to-pdf.user.js`: runs in the presse.mozaik.co (PressReader white-label) viewer, captures the page tickets from `IssueInfo/GetPageKeys`, and downloads every page from `i.prcdn.co` as a ZIP of JPEGs or a PDF (both written by small built-in, dependency-free writers).
+
 There is no package manager, build step, bundler, or automated test suite in this repo.
 
 ## Editing Rules
@@ -43,6 +45,12 @@ These two scripts work as a pair but run on different origins, so they cannot sh
 - Sonarr/Radarr use API `v3`; Lidarr uses API `v1`. Keep each target's `apiVersion` field correct - a mismatch 404s and returns Lidarr's SPA HTML shell instead of JSON, which fails silently unless logged.
 - `release/push` can fail two different ways: a FluentValidation array (`[{propertyName, errorMessage}]`) when the title can't be parsed at all, or a resolved release object (`{rejected, rejections}`) when it parses but doesn't match a monitored item in the library. `isUnparseableTitle()` in `ext-to-arr-push-button.user.js` checks both shapes.
 - Lidarr's title parser expects `Artist - Album` style separators; some music releases use `|` instead, which `pushReleaseWithRetry()` retries once with `|` replaced by `-`.
+
+## Mozaik to PDF Script Notes
+
+- Page images are `https://i.prcdn.co/img?file=<issue>&page=<n>&scale=<s>&ticket=<key>`; `<issue>` and the per-page `<key>` both come from the viewer's own `GetPageKeys` request, which the script observes by patching `fetch`/`XMLHttpRequest` at `document-start` (no auth flow is reimplemented).
+- Before downloading, that request is replayed with `pageNumber=0` to fill any pages the viewer had not asked for yet.
+- The PDF writer embeds JPEG bytes untouched (`/DCTDecode`); anything else (WebP, PNG, CMYK JPEG) is re-encoded to RGB JPEG through a canvas first.
 
 ## Validation
 
