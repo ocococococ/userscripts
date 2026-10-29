@@ -1,20 +1,31 @@
 {
   "cSpell.words": [
+    "apos",
     "arrpush",
     "Discogs",
+    "entitylist",
     "exttoimdb",
+    "getlist",
+    "giftedaccess",
     "imdb",
     "lidarr",
     "mozaik",
     "nendobj",
     "noopener",
     "noreferrer",
+    "NOSONAR",
     "nstartxref",
     "prcdn",
     "presse",
     "pressreader",
+    "Radarr",
+    "Sonarqube",
+    "Sonarr",
     "Tampermonkey",
-    "userscripts"
+    "unparseable",
+    "userscript",
+    "userscripts",
+    "videostation"
   ],
   "codeQL.githubDatabase.download": "never"
 }

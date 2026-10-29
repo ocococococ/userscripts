@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Mozaik - Download issue as PDF/ZIP
 // @namespace    local.mozaik-to-pdf
-// @version      0.1.0
-// @description  Captures page tickets in the presse.mozaik.co (PressReader) viewer and downloads all pages as a ZIP of images or a PDF
+// @version      0.2.0
+// @description  Captures page tickets in the presse.mozaik.co (PressReader) viewer and downloads all pages as a ZIP of images or a PDF; adds Download buttons on app.mozaik.co issue pages
 // @homepageURL  https://github.com/ocococococ/userscripts
 // @downloadURL  https://raw.githubusercontent.com/ocococococ/userscripts/main/mozaik-to-pdf.user.js
 // @updateURL    https://raw.githubusercontent.com/ocococococ/userscripts/main/mozaik-to-pdf.user.js
 // @match        https://presse.mozaik.co/*
+// @match        https://app.mozaik.co/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -27,6 +28,18 @@
   const RETRIES = 2;
   // PDF pages are laid out at A4 width; height follows the image ratio.
   const PDF_PAGE_WIDTH_PT = 595;
+  // Scales tried by "Find best scale", smallest first.
+  const PROBE_SCALES = [200, 300, 400, 500, 600, 800, 1000, 1200];
+  // Set by a Download button on app.mozaik.co, consumed by the viewer once
+  // it has page keys. GM storage is per-script, so it crosses origins.
+  const AUTO_DOWNLOAD_KEY = 'AUTO_DOWNLOAD';
+  const AUTO_DOWNLOAD_TTL_MS = 3 * 60 * 1000;
+  const LAUNCH_CLASS = 'mozaik-to-pdf-launch';
+
+  if (location.hostname === 'app.mozaik.co') {
+    initLaunchButtons();
+    return;
+  }
 
   // issue id ("f6412026010100000000001001") -> Map(pageNumber -> ticket)
   const pageKeysByIssue = new Map();
@@ -34,6 +47,10 @@
   let lastKeysRequest = null; // {url, headers}
   let currentIssue = null;
   let busy = false;
+  // Set by the Stop button; checked between requests, while in-flight
+  // requests are aborted directly.
+  let cancelled = false;
+  const activeRequests = new Set();
 
   // --- Capture GetPageKeys responses from the viewer's own requests ---
 
@@ -140,21 +157,45 @@
 
   // --- Network helpers ---
 
+  class CancelledError extends Error {
+    constructor() {
+      super('Cancelled');
+    }
+  }
+
+  function throwIfCancelled() {
+    if (cancelled) throw new CancelledError();
+  }
+
   function gmRequest(url, { headers = {}, responseType = 'text' } = {}) {
+    throwIfCancelled();
     return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
+      const settle = (fn, value) => {
+        activeRequests.delete(request);
+        fn(value);
+      };
+      const request = GM_xmlhttpRequest({
         method: 'GET',
         url,
         headers,
         responseType,
         onload: (res) => {
-          if (res.status >= 200 && res.status < 300) resolve(res);
-          else reject(new Error(`HTTP ${res.status} for ${url}`));
+          if (res.status >= 200 && res.status < 300) settle(resolve, res);
+          else settle(reject, new Error(`HTTP ${res.status} for ${url}`));
         },
-        onerror: () => reject(new Error(`Network error for ${url}`)),
-        ontimeout: () => reject(new Error(`Timeout for ${url}`)),
+        onerror: () => settle(reject, new Error(`Network error for ${url}`)),
+        ontimeout: () => settle(reject, new Error(`Timeout for ${url}`)),
+        onabort: () => settle(reject, new CancelledError()),
       });
+      activeRequests.add(request);
     });
+  }
+
+  function cancelAction() {
+    if (!busy || cancelled) return;
+    cancelled = true;
+    setStatus('Stopping...');
+    for (const request of activeRequests) request.abort();
   }
 
   // The viewer may only have asked for some pages; replay its request with
@@ -217,10 +258,10 @@
     return new Uint8Array(await blob.arrayBuffer());
   }
 
-  async function fetchPageImage(issue, page, key, scale) {
+  async function fetchPageImage(issue, page, key, scale, retries = RETRIES) {
     const url = buildImageUrl(issue, page, key, scale);
     let lastError;
-    for (let attempt = 0; attempt <= RETRIES; attempt++) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
       try {
         const res = await gmRequest(url, {
           responseType: 'arraybuffer',
@@ -232,10 +273,34 @@
         }
         return bytes;
       } catch (err) {
+        if (err instanceof CancelledError) throw err;
         lastError = err;
       }
     }
     throw lastError;
+  }
+
+  // The CDN silently caps resolution: past some scale the width stops
+  // growing. Probe the first page and keep the smallest scale reaching the
+  // largest width.
+  async function findBestScale(issue, keys, onProgress) {
+    const page = Math.min(...keys.keys());
+    let best = null;
+    for (const scale of PROBE_SCALES) {
+      let width;
+      try {
+        width = readJpegInfo(await fetchPageImage(issue, page, keys.get(page), scale, 0)).width;
+      } catch (err) {
+        if (err instanceof CancelledError) throw err;
+        console.warn(LOG, `scale ${scale} failed`, err);
+        break;
+      }
+      console.log(LOG, `scale ${scale}: ${width}px`);
+      onProgress(scale, width);
+      if (best && width <= best.width) break;
+      best = { scale, width };
+    }
+    return best;
   }
 
   async function fetchAllPages(issue, keys, scale, onProgress) {
@@ -248,7 +313,8 @@
       while (next < pages.length) {
         const index = next++;
         const page = pages[index];
-        results[index] = { page, bytes: await fetchPageImage(issue, page, keys.get(page), scale) };
+        // Sequential per worker on purpose: CONCURRENCY workers bound the load on the CDN.
+        results[index] = { page, bytes: await fetchPageImage(issue, page, keys.get(page), scale) }; // NOSONAR
         onProgress(++done, pages.length);
       }
     };
@@ -270,7 +336,7 @@
 
   function crc32(bytes) {
     let crc = 0xffffffff;
-    for (let i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    for (const byte of bytes) crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
     return (crc ^ 0xffffffff) >>> 0;
   }
 
@@ -328,7 +394,27 @@
 
   // --- PDF (one JPEG per page, embedded untouched via DCTDecode) ---
 
-  function buildPdf(images) {
+  // PDF literal string; non-ASCII is dropped since we don't emit UTF-16.
+  function pdfString(text) {
+    const escaped = text.replace(/[^\x20-\x7e]/g, '?').replace(/[\\()]/g, String.raw`\$&`);
+    return '(' + escaped + ')';
+  }
+
+  // Only needed when page numbers aren't simply 1..N (missing pages):
+  // keeps the viewer's page numbers instead of renumbering.
+  function buildPageLabels(pageNumbers) {
+    const ranges = [];
+    pageNumbers.forEach((page, i) => {
+      const expected = i === 0 ? 1 : pageNumbers[i - 1] + 1;
+      if (page !== expected) ranges.push(i);
+    });
+    if (!ranges.length) return '';
+    if (ranges[0] !== 0) ranges.unshift(0);
+    const nums = ranges.map((i) => `${i} << /S /D /St ${pageNumbers[i]} >>`).join(' ');
+    return ` /PageLabels << /Nums [${nums}] >>`;
+  }
+
+  function buildPdf(images, { title, pageNumbers }) {
     const encoder = new TextEncoder();
     const parts = [];
     const offsets = [];
@@ -344,14 +430,17 @@
       push(`${id} 0 obj\n`);
     };
 
-    // Object ids: 1 catalog, 2 page tree, then 3 per page (page, content, image).
-    const pageIds = images.map((_, i) => 3 + i * 3);
+    // Object ids: 1 catalog, 2 page tree, 3 info, then 3 per page (page, content, image).
+    const pageIds = images.map((_, i) => 4 + i * 3);
 
     push('%PDF-1.4\n%\xe2\xe3\xcf\xd3\n');
     startObject(1);
-    push('<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
+    push(`<< /Type /Catalog /Pages 2 0 R${buildPageLabels(pageNumbers)} >>\nendobj\n`);
     startObject(2);
-    push(`<< /Type /Pages /Kids [${pageIds.map((id) => `${id} 0 R`).join(' ')}] /Count ${images.length} >>\nendobj\n`);
+    const kids = pageIds.map((id) => id + ' 0 R').join(' ');
+    push(`<< /Type /Pages /Kids [${kids}] /Count ${images.length} >>\nendobj\n`);
+    startObject(3);
+    push(`<< /Title ${pdfString(title)} /Producer (mozaik-to-pdf userscript) >>\nendobj\n`);
 
     images.forEach((bytes, i) => {
       const info = readJpegInfo(bytes);
@@ -377,25 +466,40 @@
       push('\nendstream\nendobj\n');
     });
 
-    const objectCount = 3 + images.length * 3;
+    const objectCount = 4 + images.length * 3;
     const xrefOffset = length;
     let xref = `xref\n0 ${objectCount}\n0000000000 65535 f \n`;
     for (let id = 1; id < objectCount; id++) {
       xref += `${String(offsets[id]).padStart(10, '0')} 00000 n \n`;
     }
     push(xref);
-    push(`trailer\n<< /Size ${objectCount} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`);
+    push(`trailer\n<< /Size ${objectCount} /Root 1 0 R /Info 3 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`);
 
     return new Blob(parts, { type: 'application/pdf' });
   }
 
   // --- Download ---
 
-  // "/france/diapason/20261023" -> "diapason-2026-10-23"
+  // "/france/diapason/20261023" -> {slug: "diapason", date: "2026-10-23"}
+  function parseViewerPath() {
+    const match = /\/([^/]+)\/(\d{4})(\d{2})(\d{2})\/?$/.exec(location.pathname);
+    return match ? { slug: match[1], date: `${match[2]}-${match[3]}-${match[4]}` } : null;
+  }
+
   function buildBaseName(issue) {
-    const match = location.pathname.match(/\/([^/]+)\/(\d{4})(\d{2})(\d{2})\/?$/);
-    if (match) return `${match[1]}-${match[2]}-${match[3]}-${match[4]}`;
-    return issue;
+    const parsed = parseViewerPath();
+    return parsed ? `${parsed.slug}-${parsed.date}` : issue;
+  }
+
+  // "le-monde-diplomatique" -> "Le Monde Diplomatique 2026-10-23"
+  function buildTitle(issue) {
+    const parsed = parseViewerPath();
+    if (!parsed) return issue;
+    const name = parsed.slug
+      .split('-')
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(' ');
+    return `${name} ${parsed.date}`;
   }
 
   function downloadBlob(filename, blob) {
@@ -409,27 +513,49 @@
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 
-  async function runDownload(format) {
+  // Runs one panel action with the buttons disabled; its return value (or
+  // error) stays as the status line until the next action.
+  async function runAction(action) {
     if (busy || !currentIssue) return;
     busy = true;
+    cancelled = false;
+    lastResult = '';
     updatePanel();
-
-    const scale = Number(scaleInput.value) || DEFAULT_SCALE;
-    GM_setValue('SCALE', scale);
-    const issue = currentIssue;
-
     try {
+      lastResult = await action(currentIssue);
+    } catch (err) {
+      if (err instanceof CancelledError) {
+        lastResult = 'Stopped.';
+      } else {
+        console.error(LOG, err);
+        lastResult = `Error: ${err.message}`;
+      }
+    } finally {
+      cancelled = false;
+      busy = false;
+      setProgress(null);
+      updatePanel();
+    }
+  }
+
+  function runDownload(format) {
+    return runAction(async (issue) => {
+      const scale = Number(scaleInput?.value) || GM_getValue('SCALE', DEFAULT_SCALE);
+      GM_setValue('SCALE', scale);
+
       setStatus('Fetching page list...');
       await refreshAllPageKeys();
       const keys = pageKeysByIssue.get(issue);
 
       const pages = await fetchAllPages(issue, keys, scale, (done, total) => {
         setStatus(`Downloading pages ${done}/${total}...`);
+        setProgress(done, total);
       });
 
+      throwIfCancelled();
       setStatus(`Building ${format.toUpperCase()}...`);
       const baseName = buildBaseName(issue);
-      const digits = String(pages[pages.length - 1].page).length;
+      const digits = String(pages.at(-1).page).length;
       if (format === 'zip') {
         const files = pages.map(({ page, bytes }) => ({
           name: `${baseName}/page-${String(page).padStart(Math.max(3, digits), '0')}.jpg`,
@@ -437,25 +563,50 @@
         }));
         downloadBlob(`${baseName}.zip`, buildZip(files));
       } else {
-        downloadBlob(`${baseName}.pdf`, buildPdf(pages.map((p) => p.bytes)));
+        const pdf = buildPdf(
+          pages.map((p) => p.bytes),
+          { title: buildTitle(issue), pageNumbers: pages.map((p) => p.page) }
+        );
+        downloadBlob(`${baseName}.pdf`, pdf);
       }
-      setStatus(`Done: ${pages.length} pages.`);
-    } catch (err) {
-      console.error(LOG, err);
-      setStatus(`Error: ${err.message}`);
-    } finally {
-      busy = false;
-      updatePanel();
-    }
+      return `Done: ${pages.length} pages at scale ${scale}.`;
+    });
+  }
+
+  function runFindScale() {
+    return runAction(async (issue) => {
+      setStatus('Probing scales...');
+      const best = await findBestScale(issue, pageKeysByIssue.get(issue), (scale, width) => {
+        setStatus(`Scale ${scale}: ${width}px wide...`);
+      });
+      if (!best) throw new Error('no scale worked, see console');
+      scaleInput.value = best.scale;
+      GM_setValue('SCALE', best.scale);
+      return `Best scale: ${best.scale} (${best.width}px wide).`;
+    });
+  }
+
+  // A Download button clicked on app.mozaik.co asked for this download.
+  function maybeAutoDownload() {
+    const request = GM_getValue(AUTO_DOWNLOAD_KEY, null);
+    if (!request) return;
+    GM_setValue(AUTO_DOWNLOAD_KEY, null);
+    if (Date.now() - request.at > AUTO_DOWNLOAD_TTL_MS) return;
+    console.log(LOG, `auto-download requested from app.mozaik.co: ${request.format}`);
+    void runDownload(request.format);
   }
 
   // --- Floating panel ---
 
   let panel = null;
   let statusLine = null;
+  let progressBar = null;
   let scaleInput = null;
   let zipButton = null;
   let pdfButton = null;
+  let probeButton = null;
+  let stopButton = null;
+  let lastResult = '';
 
   function makeButton(label, onClick) {
     const button = document.createElement('button');
@@ -471,6 +622,16 @@
     if (statusLine) statusLine.textContent = text;
   }
 
+  // setProgress(null) hides the bar.
+  function setProgress(done, total) {
+    if (!progressBar) return;
+    progressBar.style.display = done === null ? 'none' : 'block';
+    if (done !== null) {
+      progressBar.max = total;
+      progressBar.value = done;
+    }
+  }
+
   function createPanel() {
     if (panel || !document.body) return;
     panel = document.createElement('div');
@@ -480,6 +641,9 @@
 
     statusLine = document.createElement('div');
     statusLine.style.marginBottom = '6px';
+
+    progressBar = document.createElement('progress');
+    progressBar.style.cssText = 'display:none;width:100%;margin-bottom:6px';
 
     const scaleLabel = document.createElement('label');
     scaleLabel.textContent = 'Scale ';
@@ -491,11 +655,17 @@
     scaleInput.value = GM_getValue('SCALE', DEFAULT_SCALE);
     scaleInput.style.cssText = 'width:70px';
     scaleLabel.appendChild(scaleInput);
+    probeButton = makeButton('Find best', runFindScale);
+    probeButton.style.marginLeft = '6px';
+    probeButton.title = 'Download page 1 at increasing scales until it stops getting bigger';
+    scaleLabel.appendChild(probeButton);
 
     zipButton = makeButton('ZIP', () => runDownload('zip'));
     pdfButton = makeButton('PDF', () => runDownload('pdf'));
+    stopButton = makeButton('Stop', cancelAction);
+    stopButton.style.background = '#c0392b';
 
-    panel.append(statusLine, scaleLabel, zipButton, pdfButton);
+    panel.append(statusLine, progressBar, scaleLabel, zipButton, pdfButton, stopButton);
     document.body.appendChild(panel);
     updatePanel();
   }
@@ -509,12 +679,118 @@
       return;
     }
     const ready = Boolean(currentIssue) && !busy;
-    zipButton.disabled = !ready;
-    pdfButton.disabled = !ready;
-    zipButton.style.opacity = pdfButton.style.opacity = ready ? '1' : '0.5';
+    for (const button of [zipButton, pdfButton, probeButton]) {
+      button.disabled = !ready;
+      button.style.opacity = ready ? '1' : '0.5';
+    }
+    stopButton.style.display = busy ? '' : 'none';
     if (!busy) {
       const count = currentIssue ? pageKeysByIssue.get(currentIssue).size : 0;
-      setStatus(currentIssue ? `${currentIssue}: ${count} page key(s) captured` : 'Waiting for the viewer to load page keys...');
+      const keysText = currentIssue
+        ? `${currentIssue}: ${count} page key(s) captured`
+        : 'Waiting for the viewer to load page keys...';
+      setStatus(lastResult || keysText);
+    }
+    if (ready) maybeAutoDownload();
+  }
+
+  // --- app.mozaik.co: Download buttons next to "Lire" ---
+
+  const CLICKABLE = 'button, a, [role="button"]';
+  // Mozaik's "Lire" link: <a class="playBt ..." title="Lire" onclick="firePlayIframe(event)">,
+  // pointing at the giftedaccess/activate URL. It appears on more than /press pages.
+  const READ_BUTTON_SELECTOR = 'a.playBt, a[title="Lire"]';
+
+  function findReadButtons() {
+    const buttons = [...document.querySelectorAll(READ_BUTTON_SELECTOR)];
+    if (buttons.length) return buttons;
+    const fallback = findReadButtonByText();
+    return fallback ? [fallback] : [];
+  }
+
+  // Fallback if the markup changes: matches on text nodes rather than
+  // elements, so icons, wrappers or extra words ("Lire le magazine") don't
+  // matter, then climbs to the clickable ancestor if there is one.
+  function findReadButtonByText() {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let fallback = null;
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const text = node.data.trim();
+      if (!/^lire\b/i.test(text)) continue;
+      const parent = node.parentElement;
+      if (!parent || parent.closest(`.${LAUNCH_CLASS}`)) continue;
+      const target = parent.closest(CLICKABLE) || parent;
+      if (/^lire$/i.test(text)) return target;
+      fallback ??= target;
+    }
+    return fallback;
+  }
+
+  // Logs what looks like the "Lire" button when none was matched, to adjust
+  // findReadButtons() against the real markup.
+  function logReadButtonCandidates() {
+    const candidates = [...document.querySelectorAll(`${CLICKABLE}, div, span`)]
+      .filter((el) => /\blire\b/i.test(el.textContent || '') && el.textContent.length < 80)
+      .map((el) => el.outerHTML.slice(0, 300));
+    console.warn(LOG, `no "Lire" button found on ${location.href}; elements mentioning "lire":`, candidates);
+  }
+
+  // Clicking goes through the site's own "Lire" flow (gift-token activation,
+  // redirect to the viewer); the viewer then starts the download by itself.
+  function makeLaunchButton(label, format, readButton) {
+    const button = makeButton(label, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      GM_setValue(AUTO_DOWNLOAD_KEY, { format, at: Date.now() });
+      button.textContent = 'Opening viewer...';
+      readButton.click();
+    });
+    button.style.marginRight = '0';
+    return button;
+  }
+
+  // One pair of buttons per "Lire" link, in its own row since the link is
+  // full width (w-full).
+  function injectLaunchButtons() {
+    for (const readButton of findReadButtons()) {
+      if (readButton.dataset.mozaikToPdf) continue;
+      readButton.dataset.mozaikToPdf = '1';
+      const row = document.createElement('div');
+      row.className = LAUNCH_CLASS;
+      row.style.cssText = 'display:flex;gap:8px;margin-top:8px';
+      row.append(
+        makeLaunchButton('Download PDF', 'pdf', readButton),
+        makeLaunchButton('Download ZIP', 'zip', readButton)
+      );
+      console.log(LOG, 'adding Download buttons next to', readButton);
+      readButton.after(row);
+    }
+  }
+
+  // app.mozaik.co is a SPA: keep watching for the "Lire" button to render.
+  function initLaunchButtons() {
+    let scheduled = false;
+    const observer = new MutationObserver(() => {
+      if (scheduled) return;
+      scheduled = true;
+      setTimeout(() => {
+        scheduled = false;
+        injectLaunchButtons();
+      }, 200);
+    });
+    const start = () => {
+      console.log(LOG, 'watching app.mozaik.co for the "Lire" button');
+      observer.observe(document.body, { childList: true, subtree: true });
+      injectLaunchButtons();
+      setTimeout(() => {
+        const onPressPage = location.pathname.startsWith('/press');
+        if (onPressPage && !findReadButtons().length) logReadButtonCandidates();
+      }, 10000);
+    };
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', start);
+    } else {
+      start();
     }
   }
 

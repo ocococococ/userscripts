@@ -10,7 +10,7 @@ This repository publishes small browser userscripts. The current scripts are:
 - `arr-ext-to-button.user.js`: adds a button on Sonarr series pages, Radarr movie pages (via IMDb ID), and Lidarr album pages (via artist/album search, resolved through Lidarr's own API) that opens a matching search on ext.to.
 - `ext-to-arr-push-button.user.js`: adds a "Send to Sonarr/Radarr/Lidarr" button on ext.to search results that resolves the torrent's magnet link and pushes it straight into the matching *arr instance via its `release/push` API.
 
-- `mozaik-to-pdf.user.js`: runs in the presse.mozaik.co (PressReader white-label) viewer, captures the page tickets from `IssueInfo/GetPageKeys`, and downloads every page from `i.prcdn.co` as a ZIP of JPEGs or a PDF (both written by small built-in, dependency-free writers).
+- `mozaik-to-pdf.user.js`: runs in the presse.mozaik.co (PressReader white-label) viewer, captures the page tickets from `IssueInfo/GetPageKeys`, and downloads every page from `i.prcdn.co` as a ZIP of JPEGs or a PDF (both written by small built-in, dependency-free writers). It also adds "Download PDF/ZIP" buttons on `app.mozaik.co/press/<id>` issue pages.
 
 There is no package manager, build step, bundler, or automated test suite in this repo.
 
@@ -50,7 +50,10 @@ These two scripts work as a pair but run on different origins, so they cannot sh
 
 - Page images are `https://i.prcdn.co/img?file=<issue>&page=<n>&scale=<s>&ticket=<key>`; `<issue>` and the per-page `<key>` both come from the viewer's own `GetPageKeys` request, which the script observes by patching `fetch`/`XMLHttpRequest` at `document-start` (no auth flow is reimplemented).
 - Before downloading, that request is replayed with `pageNumber=0` to fill any pages the viewer had not asked for yet.
-- The PDF writer embeds JPEG bytes untouched (`/DCTDecode`); anything else (WebP, PNG, CMYK JPEG) is re-encoded to RGB JPEG through a canvas first.
+- The PDF writer embeds JPEG bytes untouched (`/DCTDecode`); anything else (WebP, PNG, CMYK JPEG) is re-encoded to RGB JPEG through a canvas first. It sets `/Title` from the viewer URL and only adds `/PageLabels` when pages are missing, so labels keep the viewer's page numbers.
+- The Stop button (shown only while busy) sets `cancelled` and aborts every in-flight `GM_xmlhttpRequest` tracked in `activeRequests`; `gmRequest()` refuses new requests while `cancelled` is set, and `CancelledError` is never retried.
+- "Find best" probes page 1 at increasing `scale` values and keeps the smallest one reaching the largest width (the CDN caps resolution); the chosen scale is stored with `GM_setValue('SCALE')`.
+- On `app.mozaik.co` the script only adds "Download PDF/ZIP" buttons under each "Lire" link (`a.playBt` / `a[title="Lire"]`, with a text-based fallback), on any page, not just `/press`. They set an `AUTO_DOWNLOAD` GM value (GM storage is per-script, so it crosses origins), then click "Lire" so the site's own gift-token flow opens the viewer; the viewer consumes that value (valid 3 minutes) once it has page keys and starts the download. The app branch returns early, so no `fetch`/`XMLHttpRequest` patching happens there.
 
 ## Validation
 
@@ -77,3 +80,7 @@ For `arr-ext-to-button.user.js` and `ext-to-arr-push-button.user.js`:
 
 - Bump `@version` for user-visible behavior changes.
 - Metadata-only or documentation-only changes do not need a version bump unless preparing a published release.
+
+## Code quality
+
+- Fix javascript warnings, especially those found by Sonarqube.
