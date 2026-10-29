@@ -35,7 +35,13 @@
   const AUTO_DOWNLOAD_KEY = 'AUTO_DOWNLOAD';
   const AUTO_DOWNLOAD_TTL_MS = 3 * 60 * 1000;
   const LAUNCH_CLASS = 'mozaik-to-pdf-launch';
+  const CLICKABLE = 'button, a, [role="button"]';
+  // Mozaik's "Lire" link: <a class="playBt ..." title="Lire" onclick="firePlayIframe(event)">,
+  // pointing at the giftedaccess/activate URL. It appears on more than /press pages.
+  const READ_BUTTON_SELECTOR = 'a.playBt, a[title="Lire"]';
 
+  // Everything the app.mozaik.co branch uses must be declared above this
+  // early return: later const/let stay uninitialized (TDZ) on that page.
   if (location.hostname === 'app.mozaik.co') {
     initLaunchButtons();
     return;
@@ -695,11 +701,6 @@
   }
 
   // --- app.mozaik.co: Download buttons next to "Lire" ---
-
-  const CLICKABLE = 'button, a, [role="button"]';
-  // Mozaik's "Lire" link: <a class="playBt ..." title="Lire" onclick="firePlayIframe(event)">,
-  // pointing at the giftedaccess/activate URL. It appears on more than /press pages.
-  const READ_BUTTON_SELECTOR = 'a.playBt, a[title="Lire"]';
 
   function findReadButtons() {
     const buttons = [...document.querySelectorAll(READ_BUTTON_SELECTOR)];
