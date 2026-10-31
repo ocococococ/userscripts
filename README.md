@@ -10,4 +10,5 @@ or [Tampermonkey for Firefox](https://addons.mozilla.org/en-US/firefox/addon/tam
   - [arr-ext-to-button.user.js](https://raw.githubusercontent.com/ocococococ/userscripts/main/arr-ext-to-button.user.js) - adds an ext.to search button on Sonarr/Radarr/Lidarr pages
   - [ext-to-arr-push-button.user.js](https://raw.githubusercontent.com/ocococococ/userscripts/main/ext-to-arr-push-button.user.js) - adds a "Send to Sonarr/Radarr/Lidarr" button on ext.to search results
   - [mozaik-presse-to-pdf.user.js](https://raw.githubusercontent.com/ocococococ/userscripts/main/mozaik-presse-to-pdf.user.js)
+  - [mozaik-books-to-epub.user.js](https://raw.githubusercontent.com/ocococococ/userscripts/main/mozaik-books-to-epub.user.js) - adds ZIP and EPUB download buttons to the Mozaik book reader
   - [telerama-to-pdf.user.js](https://raw.githubusercontent.com/ocococococ/userscripts/main/telerama-to-pdf.user.js)

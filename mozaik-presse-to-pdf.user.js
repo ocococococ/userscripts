@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mozaik - Download issue as PDF/ZIP
 // @namespace    local.mozaik-to-pdf
-// @version      0.2.1
+// @version      0.2.2
 // @description  Captures page tickets in the presse.mozaik.co (PressReader) viewer and downloads all pages as a ZIP of images or a PDF; adds Download buttons on app.mozaik.co issue pages
 // @homepageURL  https://github.com/ocococococ/userscripts
 // @downloadURL  https://raw.githubusercontent.com/ocococococ/userscripts/main/mozaik-presse-to-pdf.user.js
@@ -753,6 +753,8 @@
   // One pair of buttons per "Lire" link, in its own row since the link is
   // full width (w-full).
   function injectLaunchButtons() {
+    // Book pages have a "Lire" button too, opening the book reader (see mozaik-books-to-epub.user.js).
+    if (location.pathname.startsWith('/books')) return;
     for (const readButton of findReadButtons()) {
       if (readButton.dataset.mozaikToPdf) continue;
       readButton.dataset.mozaikToPdf = '1';

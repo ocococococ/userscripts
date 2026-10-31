@@ -11,6 +11,7 @@ This repository publishes small browser userscripts. The current scripts are:
 - `ext-to-arr-push-button.user.js`: adds a "Send to Sonarr/Radarr/Lidarr" button on ext.to search results that resolves the torrent's magnet link and pushes it straight into the matching *arr instance via its `release/push` API.
 
 - `mozaik-presse-to-pdf.user.js`: runs in the presse.mozaik.co (PressReader white-label) viewer, captures the page tickets from `IssueInfo/GetPageKeys`, and downloads every page from `i.prcdn.co` as a ZIP of JPEGs or a PDF (both written by small built-in, dependency-free writers). It also adds "Download PDF/ZIP" buttons on `app.mozaik.co/press/<id>` issue pages.
+- `mozaik-books-to-epub.user.js`: in Mozaik's book reader (`nextory.mozaik.co/reader/fr?book_id=<id>`, opened by "Lire" on `app.mozaik.co/books/<id>`), adds ZIP and EPUB buttons that download the book's EPUB parts (one small EPUB per spine item, as served to Mozaik's reader) as a ZIP, or merged into one EPUB (with a small built-in ZIP reader/writer).
 - `telerama-to-pdf.user.js`: runs in the magazine.telerama.fr (Twipe) viewer for Telerama and Sortir, captures the page list and session ids from the viewer's own requests, and downloads every page PDF as a ZIP or as one merged PDF (merged with pdf-lib).
 
 There is no package manager, build step, bundler, or automated test suite in this repo.
@@ -54,7 +55,20 @@ These two scripts work as a pair but run on different origins, so they cannot sh
 - The PDF writer embeds JPEG bytes untouched (`/DCTDecode`); anything else (WebP, PNG, CMYK JPEG) is re-encoded to RGB JPEG through a canvas first. It sets `/Title` from the viewer URL and only adds `/PageLabels` when pages are missing, so labels keep the viewer's page numbers.
 - The Stop button (shown only while busy) sets `cancelled` and aborts every in-flight `GM_xmlhttpRequest` tracked in `activeRequests`; `gmRequest()` refuses new requests while `cancelled` is set, and `CancelledError` is never retried.
 - "Find best" probes page 1 at increasing `scale` values and keeps the smallest one reaching the largest width (the CDN caps resolution); the chosen scale is stored with `GM_setValue('SCALE')`.
-- On `app.mozaik.co` the script only adds "Download PDF/ZIP" buttons under each "Lire" link (`a.playBt` / `a[title="Lire"]`, with a text-based fallback), on any page, not just `/press`. They set an `AUTO_DOWNLOAD` GM value (GM storage is per-script, so it crosses origins), then click "Lire" so the site's own gift-token flow opens the viewer; the viewer consumes that value (valid 3 minutes) once it has page keys and starts the download. The app branch returns early, so no `fetch`/`XMLHttpRequest` patching happens there.
+- On `app.mozaik.co` the script only adds "Download PDF/ZIP" buttons under each "Lire" link (`a.playBt` / `a[title="Lire"]`, with a text-based fallback), on any page, not just `/press`. They set an `AUTO_DOWNLOAD` GM value (GM storage is per-script, so it crosses origins), then click "Lire" so the site's own gift-token flow opens the viewer; the viewer consumes that value (valid 3 minutes) once it has page keys and starts the download. The app branch returns early, so no `fetch`/`XMLHttpRequest` patching happens there. It skips `/books` pages: their "Lire" button opens the book reader, where `mozaik-books-to-epub.user.js` adds its own buttons.
+
+## Mozaik Books to EPUB Script Notes
+
+- The script only runs in the reader, `nextory.mozaik.co/reader/fr?book_id=<id>` (the `data-reader-url` of the book page's `button.js-open-reader` "Lire" button), and shows a floating panel at the bottom right. The book id comes from `book_id`. Placing buttons under "Lire" on `app.mozaik.co/books/<id>` was dropped: that page renders the button twice (one per layout), recommended book titles can start with "Lire", and app.mozaik.co changes pages without reloading. `@match` must keep its trailing `*`: without it, only that exact URL matches.
+- `fetch-book`'s `media_type` decides what can be downloaded: `novel` and `graphic_novel` (comics, same EPUB parts) use `get-epub-package` (ZIP of parts, EPUB) and show `total_pages`. `audio` (audio books and podcasts alike; `get-audio-package`: per-chapter HLS `master_playlist` URIs on `connect.nextory.com` plus AES `crypt_keys`) are encrypted streams, so their audio is deliberately not downloaded: ZIP only holds the JSON below and EPUB is hidden. Other media types disable both buttons, as does waiting for `fetch-book`.
+- Every ZIP starts with `fetch-book.json` and `<endpoint>.json` (`get-epub-package.json` or `get-audio-package.json`): the `data` of each answer, pretty-printed, minus the audio package's session fields (`login_token`, `profile_token`, `device_id`).
+- The panel shows `fetch-book`'s `coverImage` as a thumbnail. That URL is on `storage.cloud.google.com`, which redirects to a Google sign-in, so the host is swapped for the public `storage.googleapis.com` (`@connect`); if the page blocks the image, it is loaded through `GM_xmlhttpRequest` as a blob, else hidden.
+- Metadata (`title`, `author`, used for the `Author - Title` file name) comes from `https://nextory.mozaik.co/proxy-api/books/fetch-book/<id>`, the parts from `.../get-epub-package/<id>` (`spines[]` with `spine_id`, `spine_href`, `spine_url`, `spine_sha256`; `toc.childrens[]`; `crypt_key`/`crypt_iv`). Both answer `{"data": ...}`.
+- API calls use `GM_xmlhttpRequest`, which sends the user's mozaik.co cookies. The script also patches `fetch`/`XMLHttpRequest` at `document-start` to replay any header the app itself sends to `proxy-api` (such as a token). Signed out, the API redirects to an HTML page, reported as "no JSON data".
+- `spine_url`s on `atlas-media.nextory.com` are signed links (`nx-expires`, `nx-signature`) that expire quickly (`403 Token has expired`), so the package is fetched when a download starts, and again for each retry of a failed part (concurrent refreshes share one request). A SHA-256 mismatch with `spine_sha256` only logs a warning.
+- ZIP keeps the raw parts (`NN-<spine_id>.epub`), useful to inspect them when the merge goes wrong. EPUB merges them: files by path (a part's own content document wins over copies in other parts), manifests by id/path, the OPF of the first part as base, the spine rebuilt in package order, `container.xml` rewritten, `mimetype` stored first. Each part's `toc.ncx` only lists its own document ("Chapter 7"), so the NCX is always rebuilt from the package `toc` (42 named entries for the sample book), plus a `nav` document when the OPF is EPUB 3 (the parts are EPUB 2.0, from "EPUBLib"). The parts' metadata says `dc:language` `en` with no author, so `language`, `author` and `publisher_name` from `fetch-book` replace/add `dc:language`, `dc:creator`, `dc:publisher`. XML lookups use `getElementsByTagNameNS('*', name)`: the OPF uses an `opf:` prefix.
+- The parts are not encrypted, so nothing is decrypted: the package's `crypt_key`/`crypt_iv` are unused. Any `META-INF/encryption.xml` (font obfuscation) is kept as served. The first part's file list is logged to the console.
+- Checked against a real book (43 parts, each a full small EPUB: fonts and its CSS repeated, about 94 MB of parts for an 11.5 MB EPUB): every manifest file present, spine and NCX consistent.
 
 ## Telerama to PDF Script Notes
 
@@ -87,6 +101,14 @@ For `arr-ext-to-button.user.js` and `ext-to-arr-push-button.user.js`:
 4. Click the real ext.to magnet icon directly first - confirm it still opens your OS's magnet handler as normal.
 5. Click "Send to ..." on a result - confirm you're prompted once for the relevant API key (first run only), and that no OS magnet-handler prompt appears this time.
 6. Confirm the button ends on "Sent (OK)" for a release Sonarr/Radarr/Lidarr can grab, or a specific rejection reason otherwise (check the console for the full `release/push` response on rejection).
+
+For `mozaik-books-to-epub.user.js`:
+
+1. Open a book page such as `https://app.mozaik.co/books/13450471` while signed in, and click "Lire".
+2. Confirm the reader shows a panel at the bottom right with the cover thumbnail, ZIP and EPUB buttons and `Author - Title`, and that the press script adds no buttons on the book page.
+3. Download the ZIP and check it holds `fetch-book.json`, `get-epub-package.json` and one `NN-<spine_id>.epub` per spine item.
+4. Download the EPUB and open it in a reader (and ideally run `epubcheck`): every chapter in order, real text, a working table of contents. Also open an audio book in the reader: EPUB is hidden, and ZIP only holds `fetch-book.json` and `get-audio-package.json` without the session tokens.
+5. Press Stop during a download and confirm it ends on "Stopped.".
 
 For `telerama-to-pdf.user.js`:
 
