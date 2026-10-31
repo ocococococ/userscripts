@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         Mozaik - Download issue as PDF/ZIP
 // @namespace    local.mozaik-to-pdf
-// @version      0.2.0
+// @version      0.2.1
 // @description  Captures page tickets in the presse.mozaik.co (PressReader) viewer and downloads all pages as a ZIP of images or a PDF; adds Download buttons on app.mozaik.co issue pages
 // @homepageURL  https://github.com/ocococococ/userscripts
-// @downloadURL  https://raw.githubusercontent.com/ocococococ/userscripts/main/mozaik-to-pdf.user.js
-// @updateURL    https://raw.githubusercontent.com/ocococococ/userscripts/main/mozaik-to-pdf.user.js
+// @downloadURL  https://raw.githubusercontent.com/ocococococ/userscripts/main/mozaik-presse-to-pdf.user.js
+// @updateURL    https://raw.githubusercontent.com/ocococococ/userscripts/main/mozaik-presse-to-pdf.user.js
 // @match        https://presse.mozaik.co/*
 // @match        https://app.mozaik.co/*
 // @grant        GM_xmlhttpRequest
@@ -20,7 +20,7 @@
 (function () {
   'use strict';
 
-  const LOG = '[mozaik-to-pdf]';
+  const LOG = '[mozaik-presse-to-pdf]';
   const PAGE_KEYS_RE = /\/IssueInfo\/GetPageKeys\b/i;
   const IMAGE_BASE = 'https://i.prcdn.co/img';
   const DEFAULT_SCALE = 300;
@@ -34,7 +34,7 @@
   // it has page keys. GM storage is per-script, so it crosses origins.
   const AUTO_DOWNLOAD_KEY = 'AUTO_DOWNLOAD';
   const AUTO_DOWNLOAD_TTL_MS = 3 * 60 * 1000;
-  const LAUNCH_CLASS = 'mozaik-to-pdf-launch';
+  const LAUNCH_CLASS = 'mozaik-presse-to-pdf-launch';
   const CLICKABLE = 'button, a, [role="button"]';
   // Mozaik's "Lire" link: <a class="playBt ..." title="Lire" onclick="firePlayIframe(event)">,
   // pointing at the giftedaccess/activate URL. It appears on more than /press pages.
@@ -446,7 +446,7 @@
     const kids = pageIds.map((id) => id + ' 0 R').join(' ');
     push(`<< /Type /Pages /Kids [${kids}] /Count ${images.length} >>\nendobj\n`);
     startObject(3);
-    push(`<< /Title ${pdfString(title)} /Producer (mozaik-to-pdf userscript) >>\nendobj\n`);
+    push(`<< /Title ${pdfString(title)} /Producer (mozaik-presse-to-pdf userscript) >>\nendobj\n`);
 
     images.forEach((bytes, i) => {
       const info = readJpegInfo(bytes);
