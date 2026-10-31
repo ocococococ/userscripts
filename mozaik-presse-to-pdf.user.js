@@ -1,13 +1,12 @@
 // ==UserScript==
 // @name         Mozaik - Download issue as PDF/ZIP
 // @namespace    local.mozaik-to-pdf
-// @version      0.3.0
-// @description  Captures page tickets in the presse.mozaik.co (PressReader) viewer and downloads all pages as a ZIP of images or a PDF; adds Download buttons on app.mozaik.co issue pages
+// @version      0.4.0
+// @description  Captures page tickets in the presse.mozaik.co (PressReader) viewer and downloads all pages as a ZIP of images or a PDF
 // @homepageURL  https://github.com/ocococococ/userscripts
 // @downloadURL  https://raw.githubusercontent.com/ocococococ/userscripts/main/mozaik-presse-to-pdf.user.js
 // @updateURL    https://raw.githubusercontent.com/ocococococ/userscripts/main/mozaik-presse-to-pdf.user.js
 // @match        https://presse.mozaik.co/*
-// @match        https://app.mozaik.co/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -32,22 +31,6 @@
   const PDF_PAGE_WIDTH_PT = 595;
   // Scales tried by "Find best scale", smallest first.
   const PROBE_SCALES = [200, 300, 400, 500, 600, 800, 1000, 1200];
-  // Set by a Download button on app.mozaik.co, consumed by the viewer once
-  // it has page keys. GM storage is per-script, so it crosses origins.
-  const AUTO_DOWNLOAD_KEY = 'AUTO_DOWNLOAD';
-  const AUTO_DOWNLOAD_TTL_MS = 3 * 60 * 1000;
-  const LAUNCH_CLASS = 'mozaik-presse-to-pdf-launch';
-  const CLICKABLE = 'button, a, [role="button"]';
-  // Mozaik's "Lire" link: <a class="playBt ..." title="Lire" onclick="firePlayIframe(event)">,
-  // pointing at the giftedaccess/activate URL. It appears on more than /press pages.
-  const READ_BUTTON_SELECTOR = 'a.playBt, a[title="Lire"]';
-
-  // Everything the app.mozaik.co branch uses must be declared above this
-  // early return: later const/let stay uninitialized (TDZ) on that page.
-  if (location.hostname === 'app.mozaik.co') {
-    initLaunchButtons();
-    return;
-  }
 
   // issue id ("f6412026010100000000001001") -> Map(pageNumber -> ticket)
   const pageKeysByIssue = new Map();
@@ -628,16 +611,6 @@
     });
   }
 
-  // A Download button clicked on app.mozaik.co asked for this download.
-  function maybeAutoDownload() {
-    const request = GM_getValue(AUTO_DOWNLOAD_KEY, null);
-    if (!request) return;
-    GM_setValue(AUTO_DOWNLOAD_KEY, null);
-    if (Date.now() - request.at > AUTO_DOWNLOAD_TTL_MS) return;
-    console.log(LOG, `auto-download requested from app.mozaik.co: ${request.format}`);
-    void runDownload(request.format);
-  }
-
   // --- Floating panel ---
 
   let panel = null;
@@ -732,104 +705,6 @@
         ? `${currentIssue}: ${count} page key(s) captured`
         : 'Waiting for the viewer to load page keys...';
       setStatus(lastResult || keysText);
-    }
-    if (ready) maybeAutoDownload();
-  }
-
-  // --- app.mozaik.co: Download buttons next to "Lire" ---
-
-  function findReadButtons() {
-    const buttons = [...document.querySelectorAll(READ_BUTTON_SELECTOR)];
-    if (buttons.length) return buttons;
-    const fallback = findReadButtonByText();
-    return fallback ? [fallback] : [];
-  }
-
-  // Fallback if the markup changes: matches on text nodes rather than
-  // elements, so icons, wrappers or extra words ("Lire le magazine") don't
-  // matter, then climbs to the clickable ancestor if there is one.
-  function findReadButtonByText() {
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    let fallback = null;
-    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-      const text = node.data.trim();
-      if (!/^lire\b/i.test(text)) continue;
-      const parent = node.parentElement;
-      if (!parent || parent.closest(`.${LAUNCH_CLASS}`)) continue;
-      const target = parent.closest(CLICKABLE) || parent;
-      if (/^lire$/i.test(text)) return target;
-      fallback ??= target;
-    }
-    return fallback;
-  }
-
-  // Logs what looks like the "Lire" button when none was matched, to adjust
-  // findReadButtons() against the real markup.
-  function logReadButtonCandidates() {
-    const candidates = [...document.querySelectorAll(`${CLICKABLE}, div, span`)]
-      .filter((el) => /\blire\b/i.test(el.textContent || '') && el.textContent.length < 80)
-      .map((el) => el.outerHTML.slice(0, 300));
-    console.warn(LOG, `no "Lire" button found on ${location.href}; elements mentioning "lire":`, candidates);
-  }
-
-  // Clicking goes through the site's own "Lire" flow (gift-token activation,
-  // redirect to the viewer); the viewer then starts the download by itself.
-  function makeLaunchButton(label, format, readButton) {
-    const button = makeButton(label, (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      GM_setValue(AUTO_DOWNLOAD_KEY, { format, at: Date.now() });
-      button.textContent = 'Opening viewer...';
-      readButton.click();
-    });
-    button.style.marginRight = '0';
-    return button;
-  }
-
-  // One pair of buttons per "Lire" link, in its own row since the link is
-  // full width (w-full).
-  function injectLaunchButtons() {
-    // Book pages have a "Lire" button too, opening the book reader (see mozaik-books-to-epub.user.js).
-    if (location.pathname.startsWith('/books')) return;
-    for (const readButton of findReadButtons()) {
-      if (readButton.dataset.mozaikToPdf) continue;
-      readButton.dataset.mozaikToPdf = '1';
-      const row = document.createElement('div');
-      row.className = LAUNCH_CLASS;
-      row.style.cssText = 'display:flex;gap:8px;margin-top:8px';
-      row.append(
-        makeLaunchButton('Download PDF', 'pdf', readButton),
-        makeLaunchButton('Download ZIP', 'zip', readButton)
-      );
-      console.log(LOG, 'adding Download buttons next to', readButton);
-      readButton.after(row);
-    }
-  }
-
-  // app.mozaik.co is a SPA: keep watching for the "Lire" button to render.
-  function initLaunchButtons() {
-    let scheduled = false;
-    const observer = new MutationObserver(() => {
-      if (scheduled) return;
-      scheduled = true;
-      setTimeout(() => {
-        scheduled = false;
-        injectLaunchButtons();
-      }, 200);
-    });
-    const start = () => {
-      console.log(LOG, 'watching app.mozaik.co for the "Lire" button');
-      observer.observe(document.body, { childList: true, subtree: true });
-      injectLaunchButtons();
-      setTimeout(() => {
-        const onPressPage = location.pathname.startsWith('/press');
-        if (onPressPage && !findReadButtons().length) logReadButtonCandidates();
-      }, 10000);
-    };
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', start);
-    } else {
-      start();
     }
   }
 

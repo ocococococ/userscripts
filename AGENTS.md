@@ -10,7 +10,7 @@ This repository publishes small browser userscripts. The current scripts are:
 - `arr-ext-to-button.user.js`: adds a button on Sonarr series pages, Radarr movie pages (via IMDb ID), and Lidarr album pages (via artist/album search, resolved through Lidarr's own API) that opens a matching search on ext.to.
 - `ext-to-arr-push-button.user.js`: adds a "Send to Sonarr/Radarr/Lidarr" button on ext.to search results that resolves the torrent's magnet link and pushes it straight into the matching *arr instance via its `release/push` API.
 
-- `mozaik-presse-to-pdf.user.js`: runs in the presse.mozaik.co (PressReader white-label) viewer, captures the page tickets from `IssueInfo/GetPageKeys`, and downloads every page from `i.prcdn.co` as a ZIP of JPEGs or a PDF (both written by small built-in, dependency-free writers). It also adds "Download PDF/ZIP" buttons on `app.mozaik.co/press/<id>` issue pages.
+- `mozaik-presse-to-pdf.user.js`: runs in the presse.mozaik.co (PressReader white-label) viewer, captures the page tickets from `IssueInfo/GetPageKeys`, and downloads every page from `i.prcdn.co` as a ZIP of JPEGs or a PDF (both written by small built-in, dependency-free writers).
 - `mozaik-books-to-epub.user.js`: in Mozaik's book reader (`nextory.mozaik.co/reader/fr?book_id=<id>`, opened by "Lire" on `app.mozaik.co/books/<id>`), adds ZIP and EPUB buttons that download the book's EPUB parts (one small EPUB per spine item, as served to Mozaik's reader) as a ZIP, or merged into one EPUB (with a small built-in ZIP reader/writer).
 - `telerama-to-pdf.user.js`: runs in the magazine.telerama.fr (Twipe) viewer for Telerama and Sortir, captures the page list and session ids from the viewer's own requests, and downloads every page PDF as a ZIP or as one merged PDF (merged with pdf-lib).
 
@@ -56,7 +56,7 @@ These two scripts work as a pair but run on different origins, so they cannot sh
 - The PDF writer embeds JPEG bytes untouched (`/DCTDecode`); anything else (WebP, PNG, CMYK JPEG) is re-encoded to RGB JPEG through a canvas first. It sets `/Title` from the viewer URL and only adds `/PageLabels` when pages are missing, so labels keep the viewer's page numbers.
 - The Stop button (shown only while busy) sets `cancelled` and aborts every in-flight `GM_xmlhttpRequest` tracked in `activeRequests`; `gmRequest()` refuses new requests while `cancelled` is set, and `CancelledError` is never retried.
 - "Find best" probes page 1 at increasing `scale` values and keeps the smallest one reaching the largest width (the CDN caps resolution); the chosen scale is stored with `GM_setValue('SCALE')`.
-- On `app.mozaik.co` the script only adds "Download PDF/ZIP" buttons under each "Lire" link (`a.playBt` / `a[title="Lire"]`, with a text-based fallback), on any page, not just `/press`. They set an `AUTO_DOWNLOAD` GM value (GM storage is per-script, so it crosses origins), then click "Lire" so the site's own gift-token flow opens the viewer; the viewer consumes that value (valid 3 minutes) once it has page keys and starts the download. The app branch returns early, so no `fetch`/`XMLHttpRequest` patching happens there. It skips `/books` pages: their "Lire" button opens the book reader, where `mozaik-books-to-epub.user.js` adds its own buttons.
+- It only runs in the viewer (`@match https://presse.mozaik.co/*`). Earlier versions also added "Download PDF/ZIP" buttons under the "Lire" links on `app.mozaik.co`, handing the download to the viewer through a GM value; dropped, since the viewer panel is enough.
 
 ## Mozaik Books to EPUB Script Notes
 
@@ -106,7 +106,7 @@ For `arr-ext-to-button.user.js` and `ext-to-arr-push-button.user.js`:
 For `mozaik-books-to-epub.user.js`:
 
 1. Open a book page such as `https://app.mozaik.co/books/13450471` while signed in, and click "Lire".
-2. Confirm the reader shows a panel at the bottom right with the cover thumbnail, ZIP and EPUB buttons and `Author - Title`, and that the press script adds no buttons on the book page.
+2. Confirm the reader shows a panel at the bottom right with the cover thumbnail, ZIP and EPUB buttons and `Author - Title`.
 3. Download the ZIP and check it holds `fetch-book.json`, `get-epub-package.json` and one `NN-<spine_id>.epub` per spine item.
 4. Download the EPUB and open it in a reader (and ideally run `epubcheck`): every chapter in order, real text, a working table of contents. Also open an audio book in the reader: EPUB is hidden, and ZIP only holds `fetch-book.json` and `get-audio-package.json` without the session tokens.
 5. Press Stop during a download and confirm it ends on "Stopped.".
