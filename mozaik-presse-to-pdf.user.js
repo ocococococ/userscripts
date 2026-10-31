@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mozaik - Download issue as PDF/ZIP
 // @namespace    local.mozaik-to-pdf
-// @version      0.2.2
+// @version      0.3.0
 // @description  Captures page tickets in the presse.mozaik.co (PressReader) viewer and downloads all pages as a ZIP of images or a PDF; adds Download buttons on app.mozaik.co issue pages
 // @homepageURL  https://github.com/ocococococ/userscripts
 // @downloadURL  https://raw.githubusercontent.com/ocococococ/userscripts/main/mozaik-presse-to-pdf.user.js
@@ -22,6 +22,8 @@
 
   const LOG = '[mozaik-presse-to-pdf]';
   const PAGE_KEYS_RE = /\/IssueInfo\/GetPageKeys\b/i;
+  // Any IssueInfo call of the viewer; its JSON answers are saved in the ZIP.
+  const ISSUE_INFO_RE = /\/services\/IssueInfo\/(\w+)/i;
   const IMAGE_BASE = 'https://i.prcdn.co/img';
   const DEFAULT_SCALE = 300;
   const CONCURRENCY = 4;
@@ -49,6 +51,8 @@
 
   // issue id ("f6412026010100000000001001") -> Map(pageNumber -> ticket)
   const pageKeysByIssue = new Map();
+  // issue id -> Map(IssueInfo method -> last JSON answer)
+  const issueInfoByIssue = new Map();
   // Last GetPageKeys request seen, replayed to make sure we have every page.
   let lastKeysRequest = null; // {url, headers}
   let currentIssue = null;
@@ -58,7 +62,7 @@
   let cancelled = false;
   const activeRequests = new Set();
 
-  // --- Capture GetPageKeys responses from the viewer's own requests ---
+  // --- Capture IssueInfo responses from the viewer's own requests ---
 
   function extractPageKeys(json) {
     const keys = new Map();
@@ -81,18 +85,26 @@
     return keys;
   }
 
-  function recordPageKeys(url, headers, text) {
+  // Keeps the JSON answer of every IssueInfo call for the ZIP, and reads the
+  // page keys from GetPageKeys.
+  function recordIssueInfo(url, headers, text) {
+    const method = ISSUE_INFO_RE.exec(url)?.[1];
     let issue;
     let json;
     try {
-      issue = new URL(url, location.href).searchParams.get('issue');
+      issue = new URL(url, location.href).searchParams.get('issue') || currentIssue;
       json = JSON.parse(text);
     } catch (err) {
-      console.warn(LOG, 'could not parse GetPageKeys response', url, err);
+      console.warn(LOG, `could not parse ${method} response`, url, err);
       return;
     }
-    if (!issue) return;
+    if (!method || !issue) return;
+    if (!issueInfoByIssue.has(issue)) issueInfoByIssue.set(issue, new Map());
+    issueInfoByIssue.get(issue).set(method, json);
+    if (PAGE_KEYS_RE.test(url)) recordPageKeys(url, headers, issue, json);
+  }
 
+  function recordPageKeys(url, headers, issue, json) {
     const keys = extractPageKeys(json);
     console.log(LOG, `GetPageKeys ${issue}: ${keys.size} key(s)`, json);
     if (!keys.size) return;
@@ -136,11 +148,11 @@
   };
 
   OriginalXHR.prototype.send = function (body) {
-    if (PAGE_KEYS_RE.test(this._mozaikUrl || '')) {
+    if (ISSUE_INFO_RE.test(this._mozaikUrl || '')) {
       this.addEventListener('load', function () {
         if (this.status >= 200 && this.status < 300) {
           const text = typeof this.response === 'string' ? this.response : this.responseText;
-          recordPageKeys(this._mozaikUrl, this._mozaikHeaders, text);
+          recordIssueInfo(this._mozaikUrl, this._mozaikHeaders, text);
         }
       });
     }
@@ -151,11 +163,11 @@
   unsafeWindow.fetch = function (input, init) {
     const url = typeof input === 'string' ? input : input?.url || String(input);
     const promise = originalFetch.apply(this, arguments);
-    if (PAGE_KEYS_RE.test(url)) {
+    if (ISSUE_INFO_RE.test(url)) {
       const headers = headersToObject(init?.headers || (typeof input === 'object' ? input.headers : null));
       promise
         .then((res) => (res.ok ? res.clone().text() : null))
-        .then((text) => text && recordPageKeys(url, headers, text))
+        .then((text) => text && recordIssueInfo(url, headers, text))
         .catch((err) => console.warn(LOG, 'fetch capture failed', err));
     }
     return promise;
@@ -212,7 +224,7 @@
     url.searchParams.set('pageNumber', '0');
     try {
       const res = await gmRequest(url.href, { headers: lastKeysRequest.headers });
-      recordPageKeys(url.href, lastKeysRequest.headers, res.responseText);
+      recordIssueInfo(url.href, lastKeysRequest.headers, res.responseText);
     } catch (err) {
       console.warn(LOG, 'could not refresh page keys, using captured ones', err);
     }
@@ -508,6 +520,30 @@
     return `${name} ${parsed.date}`;
   }
 
+  function jsonFile(baseName, name, data) {
+    const bytes = new TextEncoder().encode(`${JSON.stringify(data, null, 2)}\n`);
+    return { name: `${baseName}/${name}.json`, bytes };
+  }
+
+  // The viewer's IssueInfo answers (GetPageKeys refreshed with pageNumber=0
+  // just before), plus issue.json describing the download.
+  function buildJsonFiles(issue, baseName, scale, pages) {
+    const describe = ({ page, bytes }) => {
+      try {
+        const { width, height } = readJpegInfo(bytes);
+        return { page, width, height, bytes: bytes.length };
+      } catch {
+        return { page, bytes: bytes.length };
+      }
+    };
+    const summary = { issue, title: buildTitle(issue), viewerUrl: location.href, scale, pages: pages.map(describe) };
+    const answers = [...(issueInfoByIssue.get(issue) || [])];
+    return [
+      jsonFile(baseName, 'issue', summary),
+      ...answers.map(([method, json]) => jsonFile(baseName, `IssueInfo-${method}`, json)),
+    ];
+  }
+
   function downloadBlob(filename, blob) {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -567,7 +603,7 @@
           name: `${baseName}/page-${String(page).padStart(Math.max(3, digits), '0')}.jpg`,
           bytes,
         }));
-        downloadBlob(`${baseName}.zip`, buildZip(files));
+        downloadBlob(`${baseName}.zip`, buildZip([...buildJsonFiles(issue, baseName, scale, pages), ...files]));
       } else {
         const pdf = buildPdf(
           pages.map((p) => p.bytes),
