@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Telerama - Download issue as PDF/ZIP
 // @namespace    local.telerama-to-pdf
-// @version      0.2.0
+// @version      0.3.0
 // @description  Adds ZIP and PDF buttons to the magazine.telerama.fr (Twipe) viewer that download the open Telerama or Sortir issue as one merged PDF or as a ZIP of page PDFs
 // @homepageURL  https://github.com/ocococococ/userscripts
 // @downloadURL  https://raw.githubusercontent.com/ocococococ/userscripts/main/telerama-to-pdf.user.js
@@ -21,6 +21,9 @@
 
   const LOG = '[telerama-to-pdf]';
   const PAGES_RE = /GetPublicationPages-(\d+)\.json/i;
+  // Twipe data files are named <Name>-<id>.json (GetPublicationPages-8678.json);
+  // those of the open issue (publication or package id) are saved in the ZIP.
+  const DATA_JSON_RE = /\/([A-Za-z]+)-(\d+)\.json(?:[?#]|$)/;
   // GetDownloadCredentials/<userId>/<sessionId>/<downloadId>, requested when the viewer opens.
   const CREDENTIALS_RE = /\/GetDownloadCredentials\/([^/?#]+)\/([^/?#]+)\/([^/?#]+)/i;
   // Pdf/<pageId>/<version>/<sessionId>/<userId>/<downloadId>/url, requested by "Page actuelle".
@@ -55,6 +58,8 @@
 
   // pubId -> [{id, number, reference}] sorted by page number
   const pagesByPub = new Map();
+  // "GetPublicationPages-8678" -> last parsed answer
+  const dataJsonByName = new Map();
   // Ids the viewer passes to the API. Page PDF URLs are signed per request,
   // so they have to be asked for with these.
   let session = null; // {apiOrigin, version, userId, sessionId, downloadId, headers}
@@ -70,14 +75,22 @@
 
   // --- Capture the viewer's own requests ---
 
-  function recordPages(url, text) {
+  function recordDataJson(url, text) {
+    const match = DATA_JSON_RE.exec(url);
+    if (!match) return;
+    const name = `${match[1]}-${match[2]}`;
     let json;
     try {
       json = JSON.parse(text);
     } catch (err) {
-      console.warn(LOG, 'could not parse GetPublicationPages response', url, err);
+      console.warn(LOG, `could not parse ${name}.json`, url, err);
       return;
     }
+    dataJsonByName.set(name, json);
+    if (PAGES_RE.test(url)) recordPages(url, json);
+  }
+
+  function recordPages(url, json) {
     const pubId = String(json.PublicationId ?? PAGES_RE.exec(url)[1]);
     const pages = (json.Page || [])
       .filter((page) => Number.isFinite(page.PublicationPageID) && Number.isFinite(page.PageNumber))
@@ -105,11 +118,11 @@
     updatePanel();
   }
 
-  // Returns true when the response should be passed to recordPages().
+  // Returns true when the response should be passed to recordDataJson().
   function observeRequest(url, headers) {
     const href = new URL(url, location.href).href;
     recordSession(href, headers);
-    return PAGES_RE.test(href);
+    return DATA_JSON_RE.test(href);
   }
 
   function headersToObject(headers) {
@@ -146,7 +159,7 @@
       this.addEventListener('load', function () {
         if (this.status >= 200 && this.status < 300) {
           const text = typeof this.response === 'string' ? this.response : this.responseText;
-          recordPages(this._teleramaUrl, text);
+          recordDataJson(this._teleramaUrl, text);
         }
       });
     }
@@ -161,7 +174,7 @@
     if (observeRequest(url, headers)) {
       promise
         .then((res) => (res.ok ? res.clone().text() : null))
-        .then((text) => text && recordPages(url, text))
+        .then((text) => text && recordDataJson(url, text))
         .catch((err) => console.warn(LOG, 'fetch capture failed', err));
     }
     return promise;
@@ -470,6 +483,34 @@
     }
   }
 
+  function jsonFile(baseName, name, data) {
+    const bytes = new TextEncoder().encode(`${JSON.stringify(data, null, 2)}\n`);
+    return { name: `${baseName}/${name}.json`, bytes };
+  }
+
+  // The open issue's Twipe data files (named after the publication or package
+  // id), plus issue.json describing the download. Credentials and the signed
+  // page URLs are left out.
+  function buildJsonFiles(pubId, pages, files, baseName, issue) {
+    const packageId = /\/package\/(\d+)/.exec(location.hash)?.[1] || null;
+    const ids = new Set([pubId, packageId].filter(Boolean));
+    const summary = {
+      name: baseName,
+      issue,
+      pubId,
+      packageId,
+      viewerUrl: location.href,
+      pages: pages.map((page, index) => ({
+        number: page.number,
+        id: page.id,
+        reference: page.reference,
+        bytes: files[index]?.bytes.length,
+      })),
+    };
+    const data = [...dataJsonByName].filter(([name]) => ids.has(name.split('-').pop()));
+    return [jsonFile(baseName, 'issue', summary), ...data.map(([name, json]) => jsonFile(baseName, name, json))];
+  }
+
   function downloadBlob(filename, blob) {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -528,7 +569,8 @@
           name: `${baseName}/page-${String(page).padStart(Math.max(3, digits), '0')}.pdf`,
           bytes,
         }));
-        downloadBlob(`${baseName}.zip`, buildZip(entries));
+        const jsonFiles = buildJsonFiles(pubId, pages, files, baseName, issue);
+        downloadBlob(`${baseName}.zip`, buildZip([...jsonFiles, ...entries]));
       } else {
         const pdf = await mergePdfs(
           files.map((file) => file.bytes),
